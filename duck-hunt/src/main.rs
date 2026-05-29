@@ -26,6 +26,7 @@ enum GameState {
     Playing,
     DogReaction,
     RoundOver,
+    LevelUp,
     GameOver,
 }
 
@@ -47,6 +48,9 @@ struct DogTimer(Timer);
 
 #[derive(Resource)]
 struct RoundPauseTimer(Timer);
+
+#[derive(Resource)]
+struct LevelUpTimer(Timer);
 
 #[derive(Resource)]
 struct SpawnTimer(Timer);
@@ -78,7 +82,13 @@ struct AmmoBullet(u32);
 struct RoundText;
 
 #[derive(Component)]
+struct HitsText;
+
+#[derive(Component)]
 struct TitleScreen;
+
+#[derive(Component)]
+struct LevelUpScreen;
 
 #[derive(Component)]
 struct GameOverScreen;
@@ -114,6 +124,8 @@ fn main() {
         .add_systems(OnExit(GameState::Playing), despawn_tagged::<Duck>)
         .add_systems(OnEnter(GameState::DogReaction), spawn_dog)
         .add_systems(OnExit(GameState::DogReaction), despawn_tagged::<Dog>)
+        .add_systems(OnEnter(GameState::LevelUp), spawn_level_up_screen)
+        .add_systems(OnExit(GameState::LevelUp), despawn_tagged::<LevelUpScreen>)
         .add_systems(OnEnter(GameState::GameOver), spawn_game_over_screen)
         .add_systems(OnExit(GameState::GameOver), cleanup_scene)
         .add_systems(Update, title_input.run_if(in_state(GameState::Title)))
@@ -125,6 +137,7 @@ fn main() {
         .add_systems(Update, (move_crosshair, update_hud).run_if(in_state(GameState::DogReaction)))
         .add_systems(Update, dog_timer_tick.run_if(in_state(GameState::DogReaction)))
         .add_systems(Update, round_pause_tick.run_if(in_state(GameState::RoundOver)))
+        .add_systems(Update, level_up_tick.run_if(in_state(GameState::LevelUp)))
         .add_systems(Update, game_over_input.run_if(in_state(GameState::GameOver)))
         .run();
 }
@@ -263,9 +276,9 @@ fn setup_hud(mut commands: Commands, game: Res<GameData>) {
         ScoreText,
         SceneEntity,
     ));
-    // Round — top right
+    // Level — top right
     commands.spawn((
-        Text::new(format!("ROUND {}", game.round + 1)),
+        Text::new(format!("LEVEL {}", game.round + 1)),
         TextFont { font_size: 26.0, ..default() },
         TextColor(Color::WHITE),
         Node {
@@ -275,6 +288,20 @@ fn setup_hud(mut commands: Commands, game: Res<GameData>) {
             ..default()
         },
         RoundText,
+        SceneEntity,
+    ));
+    // Hits progress — top center
+    commands.spawn((
+        Text::new(format!("HITS: 0 / {}", DUCKS_TO_CLEAR)),
+        TextFont { font_size: 26.0, ..default() },
+        TextColor(Color::srgb(0.4, 1.0, 0.4)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Percent(50.0 - 8.0),
+            ..default()
+        },
+        HitsText,
         SceneEntity,
     ));
     // Misses — bottom right text
@@ -321,16 +348,17 @@ fn setup_hud(mut commands: Commands, game: Res<GameData>) {
 }
 
 fn init_round(mut commands: Commands, mut game: ResMut<GameData>) {
-    game.ducks_this_round = 0;
-    game.ducks_hit = 0;
+    // Only reset shots & timer — duck counts are managed by round_pause_tick and new-game reset
     game.shots_left = SHOTS_PER_WAVE;
     commands.insert_resource(SpawnTimer(Timer::from_seconds(1.0, TimerMode::Repeating)));
 }
 
 fn update_hud(
     game: Res<GameData>,
-    mut score_q: Query<&mut Text, (With<ScoreText>, Without<MissText>, Without<RoundText>)>,
-    mut miss_q: Query<&mut Text, (With<MissText>, Without<ScoreText>, Without<RoundText>)>,
+    mut score_q: Query<&mut Text, (With<ScoreText>, Without<MissText>, Without<RoundText>, Without<HitsText>)>,
+    mut miss_q: Query<&mut Text, (With<MissText>, Without<ScoreText>, Without<RoundText>, Without<HitsText>)>,
+    mut round_q: Query<&mut Text, (With<RoundText>, Without<ScoreText>, Without<MissText>, Without<HitsText>)>,
+    mut hits_q: Query<&mut Text, (With<HitsText>, Without<ScoreText>, Without<MissText>, Without<RoundText>)>,
     mut bullets: Query<(&AmmoBullet, &mut Sprite)>,
 ) {
     for mut t in &mut score_q {
@@ -339,11 +367,17 @@ fn update_hud(
     for mut t in &mut miss_q {
         **t = format!("MISSES: {}/{}", game.total_misses, MAX_MISSES);
     }
+    for mut t in &mut round_q {
+        **t = format!("LEVEL {}", game.round + 1);
+    }
+    for mut t in &mut hits_q {
+        **t = format!("HITS: {} / {}", game.ducks_hit, DUCKS_TO_CLEAR);
+    }
     for (b, mut sprite) in &mut bullets {
         sprite.color = if b.0 < game.shots_left {
-            Color::srgb(1.0, 0.82, 0.1) // loaded — gold
+            Color::srgb(1.0, 0.82, 0.1)
         } else {
-            Color::srgb(0.22, 0.22, 0.22) // spent — dark
+            Color::srgb(0.22, 0.22, 0.22)
         };
     }
 }
@@ -404,7 +438,8 @@ fn spawn_duck(
     time: Res<Time>,
     ducks: Query<&Duck>,
 ) {
-    if game.ducks_this_round >= DUCKS_PER_ROUND {
+    // Stop spawning once target is hit or round quota is met
+    if game.ducks_this_round >= DUCKS_PER_ROUND || game.ducks_hit >= DUCKS_TO_CLEAR {
         return;
     }
     let max_simultaneous = (1 + game.round).min(3);
@@ -519,13 +554,13 @@ fn move_ducks(
     mut game: ResMut<GameData>,
     time: Res<Time>,
     mut next_state: ResMut<NextState<GameState>>,
-    state: Res<State<GameState>>,
 ) {
+    let mut any_escaped = false;
+
     for (entity, mut duck, mut transform) in &mut ducks {
         duck.flap_timer += time.delta_secs();
         transform.translation.x += duck.velocity.x * time.delta_secs();
         transform.translation.y += duck.velocity.y * time.delta_secs();
-        // Sine bob
         transform.translation.y += (duck.flap_timer * 5.5).sin() * 16.0 * time.delta_secs();
 
         if transform.translation.y > WINDOW_H / 2.0 - 50.0 {
@@ -539,13 +574,19 @@ fn move_ducks(
         let escaped = transform.translation.x < -WINDOW_W / 2.0 - 70.0
             || transform.translation.x > WINDOW_W / 2.0 + 70.0;
 
-        if escaped && *state.get() == GameState::Playing {
+        if escaped {
+            // Count each escaped duck individually but only trigger one reaction
             game.total_misses += 1;
             game.last_duck_was_hit = false;
             commands.entity(entity).despawn_recursive();
-            commands.insert_resource(DogTimer(Timer::from_seconds(DOG_DISPLAY_TIME, TimerMode::Once)));
-            next_state.set(GameState::DogReaction);
+            any_escaped = true;
         }
+    }
+
+    // Single state transition regardless of how many escaped this frame
+    if any_escaped {
+        commands.insert_resource(DogTimer(Timer::from_seconds(DOG_DISPLAY_TIME, TimerMode::Once)));
+        next_state.set(GameState::DogReaction);
     }
 }
 
@@ -744,7 +785,8 @@ fn dog_timer_tick(
     if timer.0.just_finished() {
         if game.total_misses >= MAX_MISSES {
             next_state.set(GameState::GameOver);
-        } else if game.ducks_this_round >= DUCKS_PER_ROUND {
+        } else if game.ducks_hit >= DUCKS_TO_CLEAR || game.ducks_this_round >= DUCKS_PER_ROUND {
+            // Hit target reached OR all ducks spawned — end the round
             commands.insert_resource(RoundPauseTimer(Timer::from_seconds(ROUND_PAUSE_TIME, TimerMode::Once)));
             next_state.set(GameState::RoundOver);
         } else {
@@ -761,13 +803,15 @@ fn check_round_end(
     mut next_state: ResMut<NextState<GameState>>,
     ducks: Query<&Duck>,
 ) {
-    if game.ducks_this_round >= DUCKS_PER_ROUND && ducks.is_empty() {
+    let round_done = game.ducks_hit >= DUCKS_TO_CLEAR || game.ducks_this_round >= DUCKS_PER_ROUND;
+    if round_done && ducks.is_empty() {
         commands.insert_resource(RoundPauseTimer(Timer::from_seconds(ROUND_PAUSE_TIME, TimerMode::Once)));
         next_state.set(GameState::RoundOver);
     }
 }
 
 fn round_pause_tick(
+    mut commands: Commands,
     mut timer: ResMut<RoundPauseTimer>,
     time: Res<Time>,
     mut game: ResMut<GameData>,
@@ -779,8 +823,62 @@ fn round_pause_tick(
             next_state.set(GameState::GameOver);
         } else {
             game.round += 1;
-            next_state.set(GameState::Playing);
+            game.ducks_this_round = 0;
+            game.ducks_hit = 0;
+            commands.insert_resource(LevelUpTimer(Timer::from_seconds(2.5, TimerMode::Once)));
+            next_state.set(GameState::LevelUp);
         }
+    }
+}
+
+// ─── Level Up ────────────────────────────────────────────────────────────────
+
+fn spawn_level_up_screen(mut commands: Commands, game: Res<GameData>) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(18.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.60)),
+            LevelUpScreen,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("LEVEL UP!"),
+                TextFont { font_size: 80.0, ..default() },
+                TextColor(Color::srgb(0.2, 1.0, 0.3)),
+            ));
+            p.spawn((
+                Text::new(format!("Now entering Level {}", game.round + 1)),
+                TextFont { font_size: 36.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+            p.spawn((
+                Text::new(format!(
+                    "Duck speed: {:.0}  |  Max ducks: {}",
+                    DUCK_SPEED_BASE + game.round as f32 * DUCK_SPEED_PER_ROUND,
+                    (1 + game.round).min(3)
+                )),
+                TextFont { font_size: 22.0, ..default() },
+                TextColor(Color::srgb(0.75, 0.95, 0.75)),
+            ));
+        });
+}
+
+fn level_up_tick(
+    mut timer: ResMut<LevelUpTimer>,
+    time: Res<Time>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    timer.0.tick(time.delta());
+    if timer.0.just_finished() {
+        next_state.set(GameState::Playing);
     }
 }
 
