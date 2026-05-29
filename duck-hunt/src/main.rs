@@ -819,15 +819,12 @@ fn round_pause_tick(
 ) {
     timer.0.tick(time.delta());
     if timer.0.just_finished() {
-        if game.ducks_hit < DUCKS_TO_CLEAR {
-            next_state.set(GameState::GameOver);
-        } else {
-            game.round += 1;
-            game.ducks_this_round = 0;
-            game.ducks_hit = 0;
-            commands.insert_resource(LevelUpTimer(Timer::from_seconds(2.5, TimerMode::Once)));
-            next_state.set(GameState::LevelUp);
-        }
+        // Only game over condition is total_misses >= MAX_MISSES (checked in dog_timer_tick)
+        game.round += 1;
+        game.ducks_this_round = 0;
+        game.ducks_hit = 0;
+        commands.insert_resource(LevelUpTimer(Timer::from_seconds(2.5, TimerMode::Once)));
+        next_state.set(GameState::LevelUp);
     }
 }
 
